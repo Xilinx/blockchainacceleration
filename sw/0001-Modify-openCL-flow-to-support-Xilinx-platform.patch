@@ -1,0 +1,1791 @@
+From 141918c501d9da912f3685cb1a1522971d190633 Mon Sep 17 00:00:00 2001
+From: Tuo Lin <tuol@xilinx.com>
+Date: Thu, 8 Jul 2021 08:31:00 -0700
+Subject: [PATCH] Modify openCL flow to support Xilinx platform
+
+---
+ .gitmodules                                |   3 +
+ CMakeLists.txt                             |   2 +-
+ libdevcore/Worker.cpp                      |   2 +-
+ libethash-cl/CLMiner.cpp                   | 909 +++++++++++++++--------------
+ libethash-cl/CLMiner.h                     | 108 +++-
+ libethash-cl/CMakeLists.txt                |  15 +
+ libethash-cl/HLS_arbitrary_Precision_Types |   1 +
+ libethash-cl/xcl2.cpp                      | 263 +++++++++
+ libethash-cl/xcl2.hpp                      |  96 +++
+ libethcore/Farm.cpp                        |  24 +-
+ libethcore/Miner.h                         |   3 +-
+ 11 files changed, 959 insertions(+), 467 deletions(-)
+ create mode 160000 libethash-cl/HLS_arbitrary_Precision_Types
+ create mode 100644 libethash-cl/xcl2.cpp
+ create mode 100644 libethash-cl/xcl2.hpp
+
+diff --git a/.gitmodules b/.gitmodules
+index a64a705..a67c97f 100644
+--- a/.gitmodules
++++ b/.gitmodules
+@@ -5,3 +5,6 @@
+ 	path = cmake/cable
+ 	url = https://github.com/ethereum/cable
+ 	branch = master
++[submodule "libethash-cl/HLS_arbitrary_Precision_Types"]
++	path = libethash-cl/HLS_arbitrary_Precision_Types
++	url = https://github.com/Xilinx/HLS_arbitrary_Precision_Types.git
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 6a2a07a..ef0f04b 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -25,7 +25,7 @@ set(PROJECT_VERSION 0.19.0)
+ cable_set_build_type(DEFAULT Release CONFIGURATION_TYPES Release RelWithDebInfo)
+ 
+ option(ETHASHCL "Build with OpenCL mining" ON)
+-option(ETHASHCUDA "Build with CUDA mining" ON)
++option(ETHASHCUDA "Build with CUDA mining" OFF)
+ option(ETHASHCPU "Build with CPU mining (only for development)" OFF)
+ option(ETHDBUS "Build with D-Bus support" OFF)
+ option(APICORE "Build with API Server support" ON)
+diff --git a/libdevcore/Worker.cpp b/libdevcore/Worker.cpp
+index 9e15d38..b33c874 100644
+--- a/libdevcore/Worker.cpp
++++ b/libdevcore/Worker.cpp
+@@ -53,7 +53,7 @@ void Worker::startWorking()
+                 (void)ok;
+ 
+                 try
+-                {
++                {   
+                     workLoop();
+                 }
+                 catch (std::exception const& _e)
+diff --git a/libethash-cl/CLMiner.cpp b/libethash-cl/CLMiner.cpp
+index 38a2b5c..0f240eb 100644
+--- a/libethash-cl/CLMiner.cpp
++++ b/libethash-cl/CLMiner.cpp
+@@ -11,6 +11,14 @@
+ #include "CLMiner.h"
+ #include "ethash.h"
+ 
++#include "xcl2.hpp"
++
++#include <stdlib.h>
++#include <iostream>
++#include <fstream>
++
++#include "ap_int.h"
++
+ using namespace dev;
+ using namespace eth;
+ 
+@@ -22,7 +30,6 @@ namespace eth
+ // WARNING: Do not change the value of the following constant
+ // unless you are prepared to make the neccessary adjustments
+ // to the assembly code for the binary kernels.
+-const size_t c_maxSearchResults = 4;
+ 
+ struct CLChannel : public LogChannel
+ {
+@@ -235,8 +242,7 @@ std::vector<cl::Device> getDevices(
+     size_t platform_num = min<size_t>(_platformId, _platforms.size() - 1);
+     try
+     {
+-        _platforms[platform_num].getDevices(
+-            CL_DEVICE_TYPE_GPU | CL_DEVICE_TYPE_ACCELERATOR, &devices);
++        _platforms[platform_num].getDevices(CL_DEVICE_TYPE_ACCELERATOR, &devices);
+     }
+     catch (cl::Error const& err)
+     {
+@@ -247,17 +253,257 @@ std::vector<cl::Device> getDevices(
+     return devices;
+ }
+ 
++template <typename T>
++T* aligned_alloc(std::size_t num) {
++    void* ptr = nullptr;
++    if (posix_memalign(&ptr, 4096, num * sizeof(T))) throw std::bad_alloc();
++    return reinterpret_cast<T*>(ptr);
++}
++
+ }  // namespace
+ 
+ }  // namespace eth
+ }  // namespace dev
+ 
+-CLMiner::CLMiner(unsigned _index, CLSettings _settings, DeviceDescriptor& _device)
++void CLMiner::prepareEthash() {
++    if(m_context.size() == 0 || m_queue.size() == 0 || m_binary.size() == 0 || m_program.size() == 0 || m_searchKernel.size() == 0 || m_ethash_dag_nodes.size() == 0 || m_ethash_ret.size() == 0) {
++        clear_buffer();
++        clear_obj();
++        clear_cq();
++
++        // context and command queue
++        m_context.push_back(cl::Context(m_device));
++        for(int i = 0; i < m_device_num; i++) {
++            m_queue.push_back(cl::CommandQueue(m_context[0], m_device[i], CL_QUEUE_PROFILING_ENABLE | CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE));
++        } 
++
++        int sys_call_ret;
++        //sys_call_ret=system("xbutil program -p ethash_kernel.xclbin");
++        //sys_call_ret=system("xbutil clock -f 200 -h 300");
++
++        // binary and program
++        std::string ethash_xclbin_path("./ethash_kernel.xclbin");
++        m_binary.push_back(xcl::import_binary_file(ethash_xclbin_path));
++        for(int i = 0; i < m_device_num; i++) {
++            m_program.push_back(cl::Program(m_context[0], {m_device[i]}, m_binary[0]));
++        }
++
++        // kernel
++        m_searchKernel.resize(m_device_num);
++        for(int i = 0; i < m_device_num; i++) {
++            m_searchKernel[i].push_back(cl::Kernel(m_program[i], "ethash_kernel0"));
++            m_searchKernel[i].push_back(cl::Kernel(m_program[i], "ethash_kernel1"));
++            m_searchKernel[i].push_back(cl::Kernel(m_program[i], "ethash_kernel2"));
++            m_searchKernel[i].push_back(cl::Kernel(m_program[i], "ethash_kernel3"));
++            m_searchKernel[i].push_back(cl::Kernel(m_program[i], "ethash_kernel4"));
++            m_searchKernel[i].push_back(cl::Kernel(m_program[i], "ethash_kernel5"));
++            m_searchKernel[i].push_back(cl::Kernel(m_program[i], "ethash_kernel6"));
++            m_searchKernel[i].push_back(cl::Kernel(m_program[i], "ethash_kernel7"));
++        }
++
++        // buffer
++        m_ethash_dag_nodes.resize(m_device_num);
++        m_ethash_ret.resize(m_device_num);
++        for(int d = 0; d < m_device_num; d++) {
++            cl_mem_ext_ptr_t mext_act_dag_nodes[hbm_group_num];
++            for (int i = 0; i < hbm_group_num; i++) {
++                mext_act_dag_nodes[i] = {i + 20, host_dag_remap[i], m_searchKernel[d][0]()};
++            }
++            cl_mem_ext_ptr_t mext_act_ret = {24, host_ret[d], m_searchKernel[d][0]()};
++
++            m_ethash_dag_nodes[d].resize(hbm_group_num);
++            for (int i = 0; i < hbm_group_num; i++) {
++                m_ethash_dag_nodes[d][i] = cl::Buffer(m_context[0], CL_MEM_EXT_PTR_XILINX | CL_MEM_USE_HOST_PTR | CL_MEM_READ_ONLY, sizeof(char) * (2048UL * 1024UL * 1024UL - 4096UL), &mext_act_dag_nodes[i]);
++            }
++            m_ethash_ret[d] = cl::Buffer(m_context[0], CL_MEM_EXT_PTR_XILINX | CL_MEM_USE_HOST_PTR | CL_MEM_READ_WRITE, sizeof(char) * (4096UL), &mext_act_ret);
++        }
++
++        // transfer DAG
++/*
++        std::cout << "DAG transfer begin" << std::endl;
++        vector<vector<cl::Memory> > ib;
++        ib.resize(m_device_num);
++        for(int d = 0; d < m_device_num; d++) {
++            for (int i = 0; i < hbm_group_num; i++) {
++                ib[d].push_back(m_ethash_dag_nodes[d][i]);
++            }
++            ib[d].push_back(m_ethash_ret[d]);
++        }
++
++        vector<cl::Event> update_dag_event;
++        update_dag_event.resize(m_device_num);
++        for(int d = 0; d < m_device_num; d++) {
++            m_queue[d].enqueueMigrateMemObjects(ib[d], 0, nullptr, &update_dag_event[d]);
++            m_queue[d].finish();
++            std::cout << "DAG for device[" << d << "] is done" << std::endl;
++        }
++        std::cout << "DAG transfer finished" << std::endl;
++*/
++        for(int d = 0; d < m_device_num; d++) {
++            vector<cl::Memory> ib;
++            for(int i = 0; i < hbm_group_num; i++) {
++                ib.push_back(m_ethash_dag_nodes[d][i]);
++            }
++            ib.push_back(m_ethash_ret[d]);
++
++            cl::Event update_dag_event;
++            m_queue[d].enqueueMigrateMemObjects(ib, 0, nullptr, &update_dag_event);
++            m_queue[d].finish();
++            std::cout << "device[" << d << "]'s DAG is finished" << std::endl;
++        }
++    }
++}
++
++void CLMiner::updateEthashConfig(const WorkPackage& wp) {
++    // act dag size
++    uint32_t full_size = m_epochContext.dagSize / 128;
++
++    // header
++    ap_uint<256> header = 0;
++    memcpy((void*)&header, wp.header.data(), (256 / 8));
++    uint32_t header_32[8];
++    for(int i = 0; i < 8; i++) {
++        header_32[i] = header.range(31 + i * 32, i * 32);
++    }
++
++    // boundary
++    ap_uint<256> boundary = 0;
++    for(int i = 0; i < 256 / 8; i++) {
++        memcpy(((void*)&boundary) + i, &(wp.boundary.data()[256 / 8 - 1 - i]), 1);
++    }
++    uint32_t boundary_32[8];
++    for(int i = 0; i < 8; i++) {
++        boundary_32[i] = boundary.range(31 + i * 32, i * 32);
++    }    
++
++    for(int d = 0; d < m_device_num; d++) {    
++        // nonce_start
++        uint32_t nonce_start0[8];
++        uint32_t nonce_start1[8];
++        for(int i = 0; i < 8; i++) {
++            ap_uint<64> nonce_start = wp.startNonce + (i + d * kernel_enable_num) * single_kernel_batch_num * 4096;
++            nonce_start0[i] = nonce_start.range(31, 0); 
++            nonce_start1[i] = nonce_start.range(63, 32);
++        }
++
++        // set arguments
++        for(int i = 0; i < kernel_enable_num; i++) {
++            int j = 0;
++            m_searchKernel[d][i].setArg(j++, full_size);
++            m_searchKernel[d][i].setArg(j++, header_32[0]);
++            m_searchKernel[d][i].setArg(j++, header_32[1]);
++            m_searchKernel[d][i].setArg(j++, header_32[2]);
++            m_searchKernel[d][i].setArg(j++, header_32[3]);
++            m_searchKernel[d][i].setArg(j++, header_32[4]);
++            m_searchKernel[d][i].setArg(j++, header_32[5]);
++            m_searchKernel[d][i].setArg(j++, header_32[6]);
++            m_searchKernel[d][i].setArg(j++, header_32[7]);
++            m_searchKernel[d][i].setArg(j++, boundary_32[0]);
++            m_searchKernel[d][i].setArg(j++, boundary_32[1]);
++            m_searchKernel[d][i].setArg(j++, boundary_32[2]);
++            m_searchKernel[d][i].setArg(j++, boundary_32[3]);
++            m_searchKernel[d][i].setArg(j++, boundary_32[4]);
++            m_searchKernel[d][i].setArg(j++, boundary_32[5]);
++            m_searchKernel[d][i].setArg(j++, boundary_32[6]);
++            m_searchKernel[d][i].setArg(j++, boundary_32[7]);
++            m_searchKernel[d][i].setArg(j++, nonce_start0[i]);
++            m_searchKernel[d][i].setArg(j++, nonce_start1[i]);
++            m_searchKernel[d][i].setArg(j++, single_kernel_batch_num);
++            m_searchKernel[d][i].setArg(j++, m_ethash_dag_nodes[d][0]);
++            m_searchKernel[d][i].setArg(j++, m_ethash_dag_nodes[d][1]);
++            m_searchKernel[d][i].setArg(j++, m_ethash_dag_nodes[d][2]);
++            m_searchKernel[d][i].setArg(j++, m_ethash_dag_nodes[d][3]);
++            m_searchKernel[d][i].setArg(j++, m_ethash_ret[d]);
++        }
++    }
++}
++
++void CLMiner::ethashSearch(SearchResults& result) {
++    vector<vector<cl::Event> > task_event;
++    task_event.resize(m_device_num);
++    for(int d = 0; d < m_device_num; d++) {
++        task_event[d].resize(kernel_enable_num);
++        for(int i = 0; i < kernel_enable_num; i++) {
++            m_queue[d].enqueueTask(m_searchKernel[d][i], nullptr, &task_event[d][i]);
++        }
++    }
++
++    vector<vector<cl::Memory> > ob;
++    ob.resize(m_device_num);
++    for(int d = 0; d < m_device_num; d++) {
++        ob[d].push_back(m_ethash_ret[d]);
++    }
++
++    vector<cl::Event> read_event;
++    read_event.resize(m_device_num);
++    for(int d = 0; d < m_device_num; d++) {
++        m_queue[d].enqueueMigrateMemObjects(ob[d], CL_MIGRATE_MEM_OBJECT_HOST, &task_event[d], &read_event[d]);
++    }
++
++    for(int d = 0; d < m_device_num; d++) {
++        m_queue[d].finish();
++    }
++
++    result.count = 0;
++    for(int d = 0; d < m_device_num; d++) {
++        for(int i = 0; i < kernel_enable_num; i++) {
++            uint32_t nonce_tmp = ((uint32_t*)host_ret[d])[i * 17];
++            if(nonce_tmp < (1 << 31)) {// MSB is 0 when valid nonce is founded
++                if(result.count < c_maxSearchResults) {// keep at most the first c_maxSearchResult sucess result
++                    // gid
++                    // ethash will get nonce by nonce = nonce start + gid
++                    // since 8 kernels has different nonce start, as real nonce start = nonce start + i * single_kernel_batch_num * 4096
++                    // here we will add the "i * single_kernel_batch_num * 4096" to gid  
++                    result.rslt[result.count].gid = ((uint32_t*)host_ret[d])[i * 17] + (i + d * kernel_enable_num) * single_kernel_batch_num * 4096;
++                    // mix
++                    memcpy(result.rslt[result.count].mix, host_ret[d] + 17 * 4 * i + 4, (256 / 8));
++                    // update result.count
++                    result.count++;
++                    std::cout << "One qualified result from device[" << d << "]" << std::endl;
++                }
++            }
++        }
++    }
++
++    if(result.count != 0) {
++        std::cout << "One batch search, got " << result.count << " qualified result" << std::endl;
++        std::cout << "actual result count = " << result.count << std::endl;
++    }
++}
++
++CLMiner::CLMiner(unsigned _index, CLSettings _settings, std::map<std::string, DeviceDescriptor>& _device_description)
+   : Miner("cl-", _index), m_settings(_settings)
+ {
+-    m_deviceDescriptor = _device;
+     m_settings.localWorkSize = ((m_settings.localWorkSize + 7) / 8) * 8;
+     m_settings.globalWorkSize = m_settings.localWorkSize * m_settings.globalWorkSizeMultiplier;
++
++    for(auto it = _device_description.begin(); it != _device_description.end(); it++) {
++        m_device_description.push_back(it->second);
++    }
++    m_device_num = m_device_description.size();
++
++    dag_checked = false;
++
++    host_dag = aligned_alloc<char>(1024UL * 1024UL * 1024UL * 8UL);
++    host_ret.resize(m_device_num);
++    for(int i = 0; i < m_device_num; i++) {
++        host_ret[i] = aligned_alloc<char>(4096UL);
++        uint32_t* ret_32 = reinterpret_cast<uint32_t*>(host_ret[i]);
++        for(int i = 0; i < 8 * 17; i++) {
++            ret_32[i] = 0;
++        }
++    }
++    
++    for(int i = 0; i < hbm_group_num; i++) {
++        host_dag_remap[i] = aligned_alloc<char>(1024UL * 1024UL * 1024UL * 2UL - 4096UL);
++    }
++
++    f_out_header.open("f_out_header.dat", ios::out | ios::binary);
++    f_out_noncestart.open("f_out_noncestart.dat", ios::out | ios::binary);
++    f_out_boundary.open("f_out_boundary.dat", ios::out | ios::binary);
++    f_out_nonce.open("f_out_nonce.dat", ios::out | ios::binary);
++    f_out_mix.open("f_out_mix.dat", ios::out | ios::binary);
++    f_out_res.open("f_out_res.dat", ios::out | ios::binary);
+ }
+ 
+ CLMiner::~CLMiner()
+@@ -265,31 +511,24 @@ CLMiner::~CLMiner()
+     DEV_BUILD_LOG_PROGRAMFLOW(cllog, "cl-" << m_index << " CLMiner::~CLMiner() begin");
+     stopWorking();
+     kick_miner();
++    free(host_dag);
++    for(int i = 0; i < m_device_num; i++) {
++        free(host_ret[i]);
++    }
++    for(int i = 0; i < hbm_group_num; i++) {
++        free(host_dag_remap[i]);
++    }
+     DEV_BUILD_LOG_PROGRAMFLOW(cllog, "cl-" << m_index << " CLMiner::~CLMiner() end");
++    f_out_header.close();
++    f_out_noncestart.close();
++    f_out_boundary.close();
++    f_out_nonce.close();
++    f_out_mix.close();
++    f_out_res.close();
+ }
+ 
+-// NOTE: The following struct must match the one defined in
+-// ethash.cl
+-struct SearchResults
+-{
+-    struct
+-    {
+-        uint32_t gid;
+-        // Can't use h256 data type here since h256 contains
+-        // more than raw data. Kernel returns raw mix hash.
+-        uint32_t mix[8];
+-        uint32_t pad[7];  // pad to 16 words for easy indexing
+-    } rslt[c_maxSearchResults];
+-    uint32_t count;
+-    uint32_t hashCount;
+-    uint32_t abort;
+-};
+-
+ void CLMiner::workLoop()
+ {
+-    // Memory for zero-ing buffers. Cannot be static or const because crashes on macOS.
+-    uint32_t zerox3[3] = {0, 0, 0};
+-
+     uint64_t startNonce = 0;
+ 
+     // The work package currently processed by GPU.
+@@ -305,37 +544,13 @@ void CLMiner::workLoop()
+         {
+ 
+             // Read results.
+-            volatile SearchResults results;
+-
+-            if (m_queue.size())
+-            {
+-                // no need to read the abort flag.
+-                m_queue[0].enqueueReadBuffer(m_searchBuffer[0], CL_TRUE,
+-                    offsetof(SearchResults, count),
+-                    (m_settings.noExit ? 1 : 2) * sizeof(results.count), (void*)&results.count);
+-                if (results.count)
+-                {
+-                    if (results.count > c_maxSearchResults) {
+-                        results.count = c_maxSearchResults;
+-                    }
+-
+-                    m_queue[0].enqueueReadBuffer(m_searchBuffer[0], CL_TRUE, 0,
+-                        results.count * sizeof(results.rslt[0]), (void*)&results);
+-                    // Reset search buffer if any solution found.
+-                    if (m_settings.noExit)
+-                        m_queue[0].enqueueWriteBuffer(m_searchBuffer[0], CL_FALSE,
+-                            offsetof(SearchResults, count), sizeof(results.count), zerox3);
+-                }
+-                // clean the solution count, hash count, and abort flag
+-                if (!m_settings.noExit)
+-                    m_queue[0].enqueueWriteBuffer(m_searchBuffer[0], CL_FALSE,
+-                        offsetof(SearchResults, count), sizeof(zerox3), zerox3);
+-            }
+-            else
+-                results.count = 0;
++            SearchResults results;
+ 
+             // Wait for work or 3 seconds (whichever the first)
+             const WorkPackage w = work();
++
++            //prepareEthash();
++
+             if (!w)
+             {
+                 boost::system_time const timeout =
+@@ -345,17 +560,16 @@ void CLMiner::workLoop()
+                 continue;
+             }
+ 
++            bool fromCurrent = false;
++
+             if (current.header != w.header)
+             {
+-
++                std::cout << "Header Change" << std::endl;
+                 if (current.epoch != w.epoch)
+                 {
+-                    m_abortqueue.clear();
+-
+                     if (!initEpoch())
+                         break;  // This will simply exit the thread
+-
+-                    m_abortqueue.push_back(cl::CommandQueue(m_context[0], m_device));
++                    prepareEthash();
+                 }
+ 
+                 // Upper 64 bits of the boundary.
+@@ -364,42 +578,28 @@ void CLMiner::workLoop()
+ 
+                 startNonce = w.startNonce;
+ 
+-                // Update header constant buffer.
+-                m_queue[0].enqueueWriteBuffer(
+-                    m_header[0], CL_FALSE, 0, w.header.size, w.header.data());
+-                // zero the result count
+-                m_queue[0].enqueueWriteBuffer(m_searchBuffer[0], CL_FALSE,
+-                    offsetof(SearchResults, count),
+-                    m_settings.noExit ? sizeof(zerox3[0]) : sizeof(zerox3), zerox3);
+-
+-                m_searchKernel.setArg(0, m_searchBuffer[0]);  // Supply output buffer to kernel.
+-                m_searchKernel.setArg(1, m_header[0]);        // Supply header buffer to kernel.
+-                m_searchKernel.setArg(2, m_dag[0]);           // Supply DAG buffer to kernel.
+-                m_searchKernel.setArg(3, m_dag[1]);           // Supply DAG buffer to kernel.
+-                m_searchKernel.setArg(4, m_dagItems);
+-                m_searchKernel.setArg(6, target);
+-
+-#ifdef DEV_BUILD
+-                if (g_logOptions & LOG_SWITCH)
+-                    cllog << "Switch time: "
+-                          << std::chrono::duration_cast<std::chrono::microseconds>(
+-                                 std::chrono::steady_clock::now() - m_workSwitchStart)
+-                                 .count()
+-                          << " us.";
+-#endif
++                updateEthashConfig(w);
++            } else {
++                updateEthashConfig(current);
++                fromCurrent = true;
+             }
+ 
+-            // Run the kernel.
+-            m_searchKernel.setArg(5, startNonce);
+-            m_queue[0].enqueueNDRangeKernel(
+-                m_searchKernel, cl::NullRange, m_settings.globalWorkSize, m_settings.localWorkSize);
+-
++            // Run the ethash kernel.
++            ethashSearch(results); 
++            
++            // Report the result
+             if (results.count)
+             {
+                 // Report results while the kernel is running.
+                 for (uint32_t i = 0; i < results.count; i++)
+                 {
+-                    uint64_t nonce = current.startNonce + results.rslt[i].gid;
++                    uint64_t nonce;
++                    if(fromCurrent) {
++                        nonce = current.startNonce + results.rslt[i].gid;
++                    } else {
++                        nonce = w.startNonce + results.rslt[i].gid;
++                    }
++
+                     if (nonce != m_lastNonce)
+                     {
+                         m_lastNonce = nonce;
+@@ -410,6 +610,26 @@ void CLMiner::workLoop()
+                             nonce, mix, current, std::chrono::steady_clock::now(), m_index});
+                         cllog << EthWhite << "Job: " << current.header.abridged() << " Sol: 0x"
+                               << toHex(nonce) << EthReset;
++
++                        const WorkPackage* ptr;
++                        if(fromCurrent) {
++                            ptr = &current;
++                        } else {
++                            ptr = &w;
++                        }
++
++                        f_out_header.write((char*)( ptr->header.data() ), (256 / 8));
++                        f_out_noncestart.write((char*)( &(ptr->startNonce) ), (64 / 8));
++                        f_out_boundary.write((char*)( ptr->boundary.data() ), (256 / 8));
++                        f_out_nonce.write((char*)( &nonce ), (64 / 8));
++                        f_out_mix.write((char*)( mix.data() ), (256 / 8));
++
++                        f_out_header.flush();
++                        f_out_noncestart.flush();
++                        f_out_boundary.flush();
++                        f_out_nonce.flush();
++                        f_out_mix.flush();
++                        f_out_res.flush();
+                     }
+                 }
+             }
+@@ -417,16 +637,16 @@ void CLMiner::workLoop()
+             current = w;  // kernel now processing newest work
+             current.startNonce = startNonce;
+             // Increase start nonce for following kernel execution.
+-            startNonce += m_settings.globalWorkSize;
++            startNonce += total_batch_try * m_device_num;
+             // Report hash count
+-            if (m_settings.noExit)
+-                updateHashRate(m_settings.globalWorkSize, 1);
+-            else
+-                updateHashRate(m_settings.localWorkSize, results.hashCount);
++            updateHashRate(total_batch_try * m_device_num, 1);
+         }
+ 
+-        if (m_queue.size())
+-            m_queue[0].finish();
++        if (m_queue.size()) {
++            for(int d = 0; d < m_device_num; d++) {
++                m_queue[d].finish();
++            }
++        }
+ 
+         clear_buffer();
+     }
+@@ -441,11 +661,6 @@ void CLMiner::workLoop()
+ void CLMiner::kick_miner()
+ {
+     // Memory for abort Cannot be static because crashes on macOS.
+-    const uint32_t one = 1;
+-    if (!m_settings.noExit && !m_abortqueue.empty())
+-        m_abortqueue[0].enqueueWriteBuffer(
+-            m_searchBuffer[0], CL_TRUE, offsetof(SearchResults, abort), sizeof(one), &one);
+-
+     m_new_work_signal.notify_one();
+ }
+ 
+@@ -469,6 +684,8 @@ void CLMiner::enumDevices(std::map<string, DeviceDescriptor>& _DevicesCollection
+             platformType = ClPlatformTypeEnum::Nvidia;
+         else if (platformName.find("Intel") != string::npos)
+             platformType = ClPlatformTypeEnum::Intel;
++        else if (platformName == "Xilinx")
++            platformType = ClPlatformTypeEnum::Xilinx;
+         else
+         {
+             std::cerr << "Unrecognized platform " << platformName << std::endl;
+@@ -484,6 +701,9 @@ void CLMiner::enumDevices(std::map<string, DeviceDescriptor>& _DevicesCollection
+         vector<cl::Device> devices = getDevices(platforms, pIdx);
+         for (auto const& device : devices)
+         {
++            //std::cout << "Single card support for test" << std::endl;
++            //auto const& device = devices[0];
++
+             DeviceTypeEnum clDeviceType = DeviceTypeEnum::Unknown;
+             cl_device_type detectedType = device.getInfo<CL_DEVICE_TYPE>();
+             if (detectedType == CL_DEVICE_TYPE_GPU)
+@@ -536,6 +756,12 @@ void CLMiner::enumDevices(std::map<string, DeviceDescriptor>& _DevicesCollection
+                 s << "CPU:" << setfill('0') << setw(2) << hex << (pIdx + dIdx);
+                 uniqueId = s.str();
+             }
++            else if (platformType == ClPlatformTypeEnum::Xilinx)
++            {
++                std::ostringstream s;
++                s << "Xilinx Alveo:" << setfill('0') << setw(2) << hex << (pIdx + dIdx);
++                uniqueId = s.str();
++            }
+             else
+             {
+                 // We're not prepared (yet) to handle other platforms or types
+@@ -596,7 +822,6 @@ void CLMiner::enumDevices(std::map<string, DeviceDescriptor>& _DevicesCollection
+ 
+         }
+     }
+-
+ }
+ 
+ bool CLMiner::initDevice()
+@@ -608,105 +833,43 @@ bool CLMiner::initDevice()
+     if (platforms.empty())
+         return false;
+ 
+-    vector<cl::Device> devices = getDevices(platforms, m_deviceDescriptor.clPlatformId);
+-    if (devices.empty())
+-        return false;
+-
+-    m_device = devices.at(m_deviceDescriptor.clDeviceOrdinal);
++    for(int i = 0; i < m_device_num; i++) {
++        vector<cl::Device> devices = getDevices(platforms, m_device_description[i].clPlatformId);
++        if (devices.empty())
++            return false;
+ 
+-    // Set Hardware Monitor Info
+-    if (m_deviceDescriptor.clPlatformType == ClPlatformTypeEnum::Nvidia)
+-    {
+-        m_hwmoninfo.deviceType = HwMonitorInfoType::NVIDIA;
+-        m_hwmoninfo.devicePciId = m_deviceDescriptor.uniqueId;
+-        m_hwmoninfo.deviceIndex = -1;  // Will be later on mapped by nvml (see Farm() constructor)
+-        m_settings.noBinary = true;
+-    }
+-    else if (m_deviceDescriptor.clPlatformType == ClPlatformTypeEnum::Amd)
+-    {
+-        m_hwmoninfo.deviceType = HwMonitorInfoType::AMD;
+-        m_hwmoninfo.devicePciId = m_deviceDescriptor.uniqueId;
+-        m_hwmoninfo.deviceIndex = -1;  // Will be later on mapped by nvml (see Farm() constructor)
+-    }
+-    else if (m_deviceDescriptor.clPlatformType == ClPlatformTypeEnum::Clover)
+-    {
+-        m_hwmoninfo.deviceType = HwMonitorInfoType::UNKNOWN;
+-        m_hwmoninfo.devicePciId = m_deviceDescriptor.uniqueId;
+-        m_hwmoninfo.deviceIndex = -1;  // Will be later on mapped by nvml (see Farm() constructor)
+-        m_settings.noBinary = true;
+-    }
+-    else if (m_deviceDescriptor.clPlatformType == ClPlatformTypeEnum::Intel)
+-    {
+-        m_hwmoninfo.deviceType = HwMonitorInfoType::UNKNOWN;
+-        m_hwmoninfo.devicePciId = m_deviceDescriptor.uniqueId;
+-        m_hwmoninfo.deviceIndex = -1;  // Will be later on mapped by nvml (see Farm() constructor)
+-        m_settings.noBinary = true;
+-        m_settings.noExit = true;
+-    }
+-    else
+-    {
+-        // Don't know what to do with this
+-        cllog << "Unrecognized Platform";
+-        return false;
+-    }
+-    if (!m_settings.noExit && (m_hwmoninfo.deviceType != HwMonitorInfoType::AMD))
+-    {
+-        m_settings.noExit = true;
+-        cllog << "no exit option enabled for non AMD opencl device";
+-    }
++        m_device.push_back(devices.at(m_device_description[i].clDeviceOrdinal));
+ 
+-    if (m_deviceDescriptor.clPlatformVersionMajor == 1 &&
+-        (m_deviceDescriptor.clPlatformVersionMinor == 0 ||
+-            m_deviceDescriptor.clPlatformVersionMinor == 1))
+-    {
+-        if (m_deviceDescriptor.clPlatformType == ClPlatformTypeEnum::Clover)
++        // Set Hardware Monitor Info
++        if (m_device_description[i].clPlatformType == ClPlatformTypeEnum::Xilinx)
+         {
+-            cllog
+-                << "OpenCL " << m_deviceDescriptor.clPlatformVersion
+-                << " not supported, but platform Clover might work nevertheless. USE AT OWN RISK!";
++            //TBA for Xilinx Platform
+         }
+         else
+         {
+-            cllog << "OpenCL " << m_deviceDescriptor.clPlatformVersion
+-                  << " not supported. Minimum required version is 1.2";
+-            throw new std::runtime_error("OpenCL 1.2 required");
++            // Don't know what to do with this
++            cllog << "Only Xilinx Platform is supported";
++            return false;
+         }
+     }
+ 
+-    ostringstream s;
+-    s << "Using Device : " << m_deviceDescriptor.uniqueId << " " << m_deviceDescriptor.clName;
+-
+-    if (!m_deviceDescriptor.clNvCompute.empty())
+-        s << " (Compute " + m_deviceDescriptor.clNvCompute + ")";
+-    else
+-        s << " " << m_deviceDescriptor.clDeviceVersion;
+-
+-    s << " Memory : " << dev::getFormattedMemory((double)m_deviceDescriptor.totalMemory);
+-    s << " (" << m_deviceDescriptor.totalMemory << " B)";
+-    cllog << s.str();
+-
+-    if ((m_deviceDescriptor.clPlatformType == ClPlatformTypeEnum::Amd) &&
+-        (m_deviceDescriptor.clMaxComputeUnits != 36))
++    if (!m_settings.noExit && (m_hwmoninfo.deviceType != HwMonitorInfoType::AMD))
+     {
+-        m_settings.globalWorkSize =
+-            (m_settings.globalWorkSize * m_deviceDescriptor.clMaxComputeUnits) / 36;
+-        // make sure that global work size is evenly divisible by the local workgroup size
+-        if (m_settings.globalWorkSize % m_settings.localWorkSize != 0)
+-            m_settings.globalWorkSize =
+-                ((m_settings.globalWorkSize / m_settings.localWorkSize) + 1) *
+-                m_settings.localWorkSize;
+-        cnote << "Adjusting CL work multiplier for " << m_deviceDescriptor.clMaxComputeUnits
+-              << " CUs. Adjusted work multiplier: "
+-              << m_settings.globalWorkSize / m_settings.localWorkSize;
++        m_settings.noExit = true;
+     }
+ 
+-
+     return true;
+-
+ }
+ 
+ bool CLMiner::initEpoch_internal()
+ {
++
++    // release ethash search related Context / CommandQueue / Kernel / Buffer
++    clear_buffer();
++    clear_obj();
++    clear_cq();
++    std::cout << "clear done " << std::endl;
++    //
+     auto startInit = std::chrono::steady_clock::now();
+     size_t RequiredMemory = (m_epochContext.dagSize);
+ 
+@@ -714,268 +877,156 @@ bool CLMiner::initEpoch_internal()
+     resume(MinerPauseEnum::PauseDueToInsufficientMemory);
+     resume(MinerPauseEnum::PauseDueToInitEpochError);
+ 
+-    // Check whether the current device has sufficient memory every time we recreate the dag
+-    if (m_deviceDescriptor.totalMemory < RequiredMemory)
+-    {
+-        cllog << "Epoch " << m_epochContext.epochNumber << " requires "
+-              << dev::getFormattedMemory((double)RequiredMemory) << " memory. Only "
+-              << dev::getFormattedMemory((double)m_deviceDescriptor.totalMemory)
+-              << " available on device.";
+-        pause(MinerPauseEnum::PauseDueToInsufficientMemory);
+-        return true;  // This will prevent to exit the thread and
+-                      // Eventually resume mining when changing coin or epoch (NiceHash)
++    // dag_kernel related parameters
++    size_t cache_size = m_epochContext.lightSize;
++    size_t cache_nodes_num = cache_size >> 6;
++
++    size_t act_dag_size = m_epochContext.dagSize;
++    size_t act_dag_nodes_num = m_epochContext.dagNumItems * 2;
++    size_t part_dag_size = 1 << 27;
++    size_t part_dag_nodes_count = part_dag_size >> 6;
++
++    const size_t cfgs_num = 3;
++    void* cache_nodes = aligned_alloc<char>(cache_size);
++    memcpy(cache_nodes, m_epochContext.lightCache, cache_size);
++    uint32_t* cfgs = aligned_alloc<uint32_t>(cfgs_num);
++
++    const int max_dag_rounds = 4;
++    int act_dag_rounds = (act_dag_size + (1024UL * 1024UL * 1024UL * 2UL - 1)) / (1024UL * 1024UL * 1024UL * 2UL);
++    std::cout << "Need " << act_dag_rounds << " rounds to generate DAG dataset of " << act_dag_size << " Bytes." << std::endl;
++
++    size_t dag_start_index = 0;
++    cfgs[0] = cache_nodes_num;
++    cfgs[1] = dag_start_index;
++    cfgs[2] = part_dag_nodes_count;
++
++    // dump cache to file
++    ofstream f_cache;
++    std::cout << "cache size: " << cache_size << " Byte" << std::endl;
++    f_cache.open("f_cache.dat", ios::out | ios::binary);
++    f_cache.write((char*)cache_nodes, cache_size);
++    f_cache.close();
++
++    // binary / context / commandQueue / kernel
++
++    cl::Context context(m_device[0]);
++    cl::CommandQueue queue(context, m_device[0], CL_QUEUE_PROFILING_ENABLE | CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE);
++    std::string dag_xclbin_path("./dag_gen_kernel.xclbin");
++    cl::Program::Binaries xclBins = xcl::import_binary_file(dag_xclbin_path);
++    cl::Program program(context, {m_device[0]}, xclBins);
++    cl::Kernel dag_gen_kernel(program, "dag_gen_kernel");
++
++    // Buffer
++    cl_mem_ext_ptr_t mext_cache_nodes[channel_num];
++    cl_mem_ext_ptr_t mext_dag_nodes[channel_num];
++    cl_mem_ext_ptr_t mext_cfgs = {channel_num * 2, cfgs, dag_gen_kernel()};
++    for (int i = 0; i < channel_num; i++) {
++        mext_cache_nodes[i] = {i, cache_nodes, dag_gen_kernel()};
++        mext_dag_nodes[i] = {i + channel_num, host_dag + (i + channel_num * (max_dag_rounds - 1)) * part_dag_size, dag_gen_kernel()};
+     }
+ 
+-    cllog << "Generating split DAG + Light (total): "
+-          << dev::getFormattedMemory((double)RequiredMemory);
+-
+-    try
+-    {
+-
+-        char options[256] = {0};
+-        int computeCapability = 0;
+-#ifndef __clang__
+-
+-        // Nvidia
+-        if (!m_deviceDescriptor.clNvCompute.empty())
+-        {
+-            computeCapability =
+-                m_deviceDescriptor.clNvComputeMajor * 10 + m_deviceDescriptor.clNvComputeMinor;
+-            int maxregs = computeCapability >= 35 ? 72 : 63;
+-            sprintf(options, "-cl-nv-maxrregcount=%d", maxregs);
+-        }
+-
+-#endif
+-        // create context
+-        m_context.clear();
+-        m_context.push_back(cl::Context(vector<cl::Device>(&m_device, &m_device + 1)));
+-        m_queue.clear();
+-        m_queue.push_back(cl::CommandQueue(m_context[0], m_device));
+-
+-
+-        m_dagItems = m_epochContext.dagNumItems;
+-
+-        // patch source code
+-        // note: The kernels here are simply compiled version of the respective .cl kernels
+-        // into a byte array by bin2h.cmake. There is no need to load the file by hand in runtime
+-        // See libethash-cl/CMakeLists.txt: add_custom_command()
+-        // TODO: Just use C++ raw string literal.
+-        string code;
+-
+-        cllog << "OpenCL kernel";
+-        code = string(ethash_cl, ethash_cl + sizeof(ethash_cl));
++    vector<cl::Buffer> m_buff_cache_nodes;
++    vector<cl::Buffer> m_buff_dag_nodes;
++    vector<cl::Buffer> m_buff_cfgs;
++
++    m_buff_cache_nodes.resize(channel_num);
++    m_buff_dag_nodes.resize(channel_num);
++    m_buff_cfgs.resize(1);
++    for (int i = 0; i < channel_num; i++) {
++        m_buff_cache_nodes[i] = cl::Buffer(context, CL_MEM_EXT_PTR_XILINX | CL_MEM_USE_HOST_PTR | CL_MEM_READ_ONLY,
++                                         sizeof(char) * (cache_size), &mext_cache_nodes[i]);
++        m_buff_dag_nodes[i] = cl::Buffer(context, CL_MEM_EXT_PTR_XILINX | CL_MEM_USE_HOST_PTR | CL_MEM_WRITE_ONLY,
++                                       sizeof(char) * (part_dag_size), &mext_dag_nodes[i]);
++    }
++    m_buff_cfgs[0] = cl::Buffer(context, CL_MEM_EXT_PTR_XILINX | CL_MEM_USE_HOST_PTR | CL_MEM_READ_WRITE,
++                           sizeof(uint32_t) * (cfgs_num), &mext_cfgs);
++    // read/write/kernel events
++    std::vector<cl::Event> write_event[max_dag_rounds];
++    std::vector<cl::Event> kernel_event[max_dag_rounds];
++    std::vector<cl::Event> read_event[max_dag_rounds];
++    for(int i = 0; i < max_dag_rounds; i++) {
++        write_event[i].resize(1);
++        kernel_event[i].resize(1);
++        read_event[i].resize(1);
++    }
++    // ib cb and ob
++    std::vector<cl::Memory> ib;
++    ib.push_back(m_buff_cfgs[0]);
++    for (int i = 0; i < channel_num; i++) {
++        ib.push_back(m_buff_cache_nodes[i]);
++        ib.push_back(m_buff_dag_nodes[i]);
++    }
+ 
+-        addDefinition(code, "WORKSIZE", m_settings.localWorkSize);
+-        addDefinition(code, "ACCESSES", 64);
+-        addDefinition(code, "MAX_OUTPUTS", c_maxSearchResults);
+-        addDefinition(code, "PLATFORM", m_deviceDescriptor.clPlatformId);
+-        addDefinition(code, "COMPUTE", computeCapability);
++    std::vector<cl::Memory> cb;
++    cb.push_back(m_buff_cfgs[0]);
+ 
+-        if (m_deviceDescriptor.clPlatformType == ClPlatformTypeEnum::Clover)
+-            addDefinition(code, "LEGACY", 1);
++    std::vector<cl::Memory> ob;
++    for (int i = 0; i < channel_num; i++) {
++        ob.push_back(m_buff_dag_nodes[i]);
++    }
+ 
+-        if (!m_settings.noExit)
+-            addDefinition(code, "FAST_EXIT", 1);
++    // set kernel arguments
++    for (int i = 0; i < channel_num; i++) {
++        dag_gen_kernel.setArg(i, m_buff_cache_nodes[i]);
++    }
++    for (int i = 0; i < channel_num; i++) {
++        dag_gen_kernel.setArg(i + channel_num, m_buff_dag_nodes[i]);
++    }
++    dag_gen_kernel.setArg(channel_num * 2, m_buff_cfgs[0]);
+ 
++    // Generate 2GB DAG each time, memcpy to correct location
++    for(int i = 0; i < act_dag_rounds; i++) {
++        dag_start_index = part_dag_nodes_count * channel_num * i;
++        cfgs[1] = dag_start_index;
+ 
+-        // create miner OpenCL program
+-        cl::Program::Sources sources{{code.data(), code.size()}};
+-        cl::Program program(m_context[0], sources), binaryProgram;
+-        try
+-        {
+-            program.build({m_device}, options);
++        if(i == 0) { // first call need to transfer cache, dag and config
++            queue.enqueueMigrateMemObjects(ib, 0, NULL, &write_event[i][0]);
++        } else { // other than first call, only need to update config
++            queue.enqueueMigrateMemObjects(cb, 0, NULL, &write_event[i][0]);
+         }
+-        catch (cl::BuildError const& buildErr)
+-        {
+-            cwarn << "OpenCL kernel build log:\n"
+-                  << program.getBuildInfo<CL_PROGRAM_BUILD_LOG>(m_device);
+-            cwarn << "OpenCL kernel build error (" << buildErr.err() << "):\n" << buildErr.what();
+-            pause(MinerPauseEnum::PauseDueToInitEpochError);
+-            return true;
+-        }
+-
+-        /* If we have a binary kernel, we load it in tandem with the opencl,
+-           that way, we can use the dag generate opencl code and fall back on
+-           the default kernel if loading fails for whatever reason */
+-        bool loadedBinary = false;
+-        std::string device_name = m_deviceDescriptor.clName;
+ 
+-        if (!m_settings.noBinary)
+-        {
+-            std::ifstream kernel_file;
+-            vector<unsigned char> bin_data;
+-            std::stringstream fname_strm;
+-
+-            /* Open kernels/ethash_{devicename}_lws{local_work_size}.bin */
+-            std::transform(device_name.begin(), device_name.end(), device_name.begin(), ::tolower);
+-            fname_strm << boost::dll::program_location().parent_path().string()
+-                       << "/kernels/ethash_" << device_name << "_lws" << m_settings.localWorkSize
+-                       << (m_settings.noExit ? "" : "_exit") << ".bin";
+-            cllog << "Loading binary kernel " << fname_strm.str();
+-            try
+-            {
+-                kernel_file.open(fname_strm.str(), ios::in | ios::binary);
++        queue.enqueueTask(dag_gen_kernel, &write_event[i], &kernel_event[i][0]);
++        queue.enqueueMigrateMemObjects(ob, CL_MIGRATE_MEM_OBJECT_HOST, &kernel_event[i], &read_event[i][0]);
++        queue.finish();
+ 
+-                if (kernel_file.good())
+-                {
+-                    /* Load the data vector with file data */
+-                    kernel_file.unsetf(std::ios::skipws);
+-                    bin_data.insert(bin_data.begin(),
+-                        std::istream_iterator<unsigned char>(kernel_file),
+-                        std::istream_iterator<unsigned char>());
+-
+-                    /* Setup the program */
+-                    cl::Program::Binaries blobs({bin_data});
+-                    cl::Program program(m_context[0], {m_device}, blobs);
+-                    try
+-                    {
+-                        program.build({m_device}, options);
+-                        cllog << "Build info success:"
+-                              << program.getBuildInfo<CL_PROGRAM_BUILD_LOG>(m_device);
+-                        binaryProgram = program;
+-                        loadedBinary = true;
+-                    }
+-                    catch (cl::Error const&)
+-                    {
+-                        cwarn << "Build failed! Info:"
+-                              << program.getBuildInfo<CL_PROGRAM_BUILD_LOG>(m_device);
+-                        cwarn << fname_strm.str();
+-                        cwarn << "Falling back to OpenCL kernel...";
+-                    }
+-                }
+-                else
+-                {
+-                    cwarn << "Failed to load binary kernel: " << fname_strm.str();
+-                    cwarn << "Falling back to OpenCL kernel...";
+-                }
+-            }
+-            catch (...)
+-            {
+-                cwarn << "Failed to load binary kernel: " << fname_strm.str();
+-                cwarn << "Falling back to OpenCL kernel...";
+-            }
++        if(i != (max_dag_rounds - 1)) { // need to mem copy to correct location
++            memcpy(host_dag + part_dag_size * channel_num * i, host_dag + part_dag_size * channel_num * (max_dag_rounds - 1), part_dag_size * channel_num);
+         }
++    }
++        // remap dag
++    ap_uint<1024>* fullnode_1K = reinterpret_cast<ap_uint<1024>*>(host_dag);
++    ap_uint<1024>* dram1K[4];
++    for (int i = 0; i < 4; i++) {
++        dram1K[i] = reinterpret_cast<ap_uint<1024>*>(host_dag_remap[i]);
++    }
++    for (ap_uint<26> i = 0; i < (act_dag_size + 127) / 128; i++) {
++        ap_uint<12> index_remapL = i.range(11, 0);
++        ap_uint<2> index_remapM = i.range(13, 12);
++        ap_uint<12> index_remapH = i.range(25, 14);
++        ap_uint<12> index_remapHR = index_remapH.reverse();
+ 
+-        // create buffer for dag
+-        try
+-        {
+-            cllog << "Creating DAG buffer, size: "
+-                  << dev::getFormattedMemory((double)m_epochContext.dagSize)
+-                  << ", free: "
+-                  << dev::getFormattedMemory(
+-                         (double)(m_deviceDescriptor.totalMemory - RequiredMemory));
+-            m_dag.clear();
+-            if (m_epochContext.dagNumItems & 1)
+-            {
+-                m_dag.push_back(
+-                    cl::Buffer(m_context[0], CL_MEM_READ_ONLY, m_epochContext.dagSize / 2 + 64));
+-                m_dag.push_back(
+-                    cl::Buffer(m_context[0], CL_MEM_READ_ONLY, m_epochContext.dagSize / 2 - 64));
+-            }
+-            else
+-            {
+-                m_dag.push_back(
+-                    cl::Buffer(m_context[0], CL_MEM_READ_ONLY, (m_epochContext.dagSize) / 2));
+-                m_dag.push_back(
+-                    cl::Buffer(m_context[0], CL_MEM_READ_ONLY, (m_epochContext.dagSize) / 2));
+-            }
+-            cllog << "Creating light cache buffer, size: "
+-                  << dev::getFormattedMemory((double)m_epochContext.lightSize);
+-            m_light.clear();
+-            bool light_on_host = false;
+-            try
+-            {
+-                m_light.emplace_back(m_context[0], CL_MEM_READ_ONLY, m_epochContext.lightSize);
+-            }
+-            catch (cl::Error const& err)
+-            {
+-                if ((err.err() == CL_OUT_OF_RESOURCES) || (err.err() == CL_OUT_OF_HOST_MEMORY))
+-                {
+-                    // Ok, no room for light cache on GPU. Try allocating on host
+-                    clog(WarnChannel) << "No room on GPU, allocating light cache on host";
+-                    clog(WarnChannel) << "Generating DAG will take minutes instead of seconds";
+-                    light_on_host = true;
+-                }
+-                else
+-                    throw;
+-            }
+-            if (light_on_host)
+-            {
+-                m_light.emplace_back(m_context[0], CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR,
+-                    m_epochContext.lightSize);
+-                cllog << "WARNING: Generating DAG will take minutes, not seconds";
+-            }
+-            cllog << "Loading kernels";
++        ap_uint<2> addrH = index_remapM;
++        ap_uint<24> addrL = index_remapHR.concat(index_remapL);
+ 
+-            // If we have a binary kernel to use, let's try it
+-            // otherwise just do a normal opencl load
+-            if (loadedBinary)
+-                m_searchKernel = cl::Kernel(binaryProgram, "search");
+-            else
+-                m_searchKernel = cl::Kernel(program, "search");
++        dram1K[addrH][addrL] = fullnode_1K[i];
++    }
+ 
+-            m_dagKernel = cl::Kernel(program, "GenerateDAG");
++    // dump dag to file
++    ofstream f_dag;
++    std::cout << "dag size: " << act_dag_size << " Byte" << std::endl;
++    f_dag.open("f_dag.dat", ios::out | ios::binary);
++    f_dag.write((char*)host_dag, act_dag_size);
+ 
+-            m_queue[0].enqueueWriteBuffer(
+-                m_light[0], CL_TRUE, 0, m_epochContext.lightSize, m_epochContext.lightCache);
+-        }
+-        catch (cl::Error const& err)
+-        {
+-            cwarn << ethCLErrorHelper("Creating DAG buffer failed", err);
+-            pause(MinerPauseEnum::PauseDueToInitEpochError);
+-            return true;
+-        }
+-        // create buffer for header
+-        cllog << "Creating buffer for header.";
+-        m_header.clear();
+-        m_header.push_back(cl::Buffer(m_context[0], CL_MEM_READ_ONLY, 32));
+-
+-        m_searchKernel.setArg(1, m_header[0]);
+-        m_searchKernel.setArg(2, m_dag[0]);
+-        m_searchKernel.setArg(3, m_dag[1]);
+-        m_searchKernel.setArg(4, m_dagItems);
+-
+-        // create mining buffers
+-        cllog << "Creating mining buffer";
+-        m_searchBuffer.clear();
+-        m_searchBuffer.emplace_back(m_context[0], CL_MEM_WRITE_ONLY, sizeof(SearchResults));
+-
+-        m_dagKernel.setArg(1, m_light[0]);
+-        m_dagKernel.setArg(2, m_dag[0]);
+-        m_dagKernel.setArg(3, m_dag[1]);
+-        m_dagKernel.setArg(4, (uint32_t)(m_epochContext.lightSize / 64));
+-
+-        const uint32_t workItems = m_dagItems * 2;  // GPU computes partial 512-bit DAG items.
+-
+-        uint32_t start;
+-        const uint32_t chunk = 10000 * m_settings.localWorkSize;
+-        for (start = 0; start <= workItems - chunk; start += chunk)
+-        {
+-            m_dagKernel.setArg(0, start);
+-            m_queue[0].enqueueNDRangeKernel(
+-                m_dagKernel, cl::NullRange, chunk, m_settings.localWorkSize);
+-            m_queue[0].finish();
+-        }
+-        if (start < workItems)
+-        {
+-            uint32_t groupsLeft = workItems - start;
+-            groupsLeft = (groupsLeft + m_settings.localWorkSize - 1) / m_settings.localWorkSize;
+-            m_dagKernel.setArg(0, start);
+-            m_queue[0].enqueueNDRangeKernel(m_dagKernel, cl::NullRange,
+-                groupsLeft * m_settings.localWorkSize, m_settings.localWorkSize);
+-            m_queue[0].finish();
+-        }
++    // clear dag gen related
++    clear_buffer();
++    clear_obj();
++    clear_cq();
++
++    // re-create ethash search related
++    //
++    free(cache_nodes);
++    free(cfgs);
+ 
+-        auto dagTime = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startInit);
+-        cllog << dev::getFormattedMemory((double)m_epochContext.dagSize)
+-              << " of DAG data generated in "
+-              << dagTime.count() << " ms.";
+-    }
+-    catch (cl::Error const& err)
+-    {
+-        cllog << ethCLErrorHelper("OpenCL init failed", err);
+-        pause(MinerPauseEnum::PauseDueToInitEpochError);
+-        return false;
+-    }
+     return true;
+ }
++
+diff --git a/libethash-cl/CLMiner.h b/libethash-cl/CLMiner.h
+index c20f51a..aed465c 100644
+--- a/libethash-cl/CLMiner.h
++++ b/libethash-cl/CLMiner.h
+@@ -24,7 +24,7 @@
+ #define CL_HPP_CL_1_2_DEFAULT_BUILD true
+ #define CL_HPP_TARGET_OPENCL_VERSION 120
+ #define CL_HPP_MINIMUM_OPENCL_VERSION 120
+-#include "CL/cl2.hpp"
++#include <libethash-cl/xcl2.hpp>
+ #pragma GCC diagnostic pop
+ 
+ // macOS OpenCL fix:
+@@ -36,15 +36,37 @@
+ #define CL_DEVICE_COMPUTE_CAPABILITY_MINOR_NV 0x4001
+ #endif
+ 
++#include<iostream>
++#include<fstream>
++
+ namespace dev
+ {
+ namespace eth
+ {
++
++const size_t c_maxSearchResults = 4;
++// NOTE: The following struct must match the one defined in
++// ethash.cl
++struct SearchResults
++{
++    struct
++    {
++        uint32_t gid;
++        // Can't use h256 data type here since h256 contains
++        // more than raw data. Kernel returns raw mix hash.
++        uint32_t mix[8];
++        uint32_t pad[7];  // pad to 16 words for easy indexing
++    } rslt[c_maxSearchResults];
++    uint32_t count;
++    uint32_t hashCount;
++    uint32_t abort;
++};
++
+ class CLMiner : public Miner
+ {
+ public:
+ 
+-    CLMiner(unsigned _index, CLSettings _settings, DeviceDescriptor& _device);
++    CLMiner(unsigned _index, CLSettings _settings, std::map<std::string, DeviceDescriptor>& _device_description);
+     ~CLMiner() override;
+ 
+     static void enumDevices(std::map<string, DeviceDescriptor>& _DevicesCollection);
+@@ -56,37 +78,87 @@ protected:
+ 
+     void kick_miner() override;
+ 
++    void printCL() 
++    {
++        std::cout << "m_context.size() " << m_context.size() << std::endl;
++        std::cout << "m_queue.size() " << m_queue.size() << std::endl;
++        std::cout << "m_program.size() " << m_program.size() << std::endl;
++        std::cout << "m_searchKernel.size() " << m_searchKernel.size() << std::endl;
++        std::cout << "m_ethash_dag_nodes.size() " << m_ethash_dag_nodes.size() << std::endl;
++        std::cout << "m_ethash_ret.size() " << m_ethash_ret.size() << std::endl;
++    }
+ private:
+-    
++    static const int hbm_group_num = 4; // 4 = 8GB / 2GB
++    static const int channel_num = 16;
++    static const int kernel_enable_num = 8;
++    const int single_kernel_batch_num = 128; // at most 8
++    static const int total_batch_try = kernel_enable_num * 128 * 4096; // 4096 is from kernel;
++
++    bool dag_checked;
++    ofstream f_out_header;
++    ofstream f_out_noncestart;
++    ofstream f_out_boundary;
++    ofstream f_out_nonce;
++    ofstream f_out_mix;
++    ofstream f_out_res;
++ 
+     void workLoop() override;
+ 
++    void prepareEthash();
++
++    void updateEthashConfig(const WorkPackage& wp);
++
++    void ethashSearch(SearchResults& result);
++
++    // Device
++    int m_device_num;
++    vector<DeviceDescriptor> m_device_description;
++    vector<cl::Device> m_device;
++
++    // Context, CommandQueue
+     vector<cl::Context> m_context;
+     vector<cl::CommandQueue> m_queue;
+-    vector<cl::CommandQueue> m_abortqueue;
+-    cl::Kernel m_searchKernel;
+-    cl::Kernel m_dagKernel;
+-    cl::Device m_device;
+ 
+-    vector<cl::Buffer> m_dag;
+-    vector<cl::Buffer> m_light;
+-    vector<cl::Buffer> m_header;
+-    vector<cl::Buffer> m_searchBuffer;
++    // Program and Kernel
++    vector<cl::Program::Binaries> m_binary;
++    vector<cl::Program> m_program;
++    vector<vector<cl::Kernel> > m_searchKernel;
++
++    // Buffer
++    vector<vector<cl::Buffer> > m_ethash_dag_nodes;
++    vector<cl::Buffer> m_ethash_ret;
++
++    // Host Memory
++    void* host_dag;
++    void* host_dag_remap[hbm_group_num];
++    vector<void*> host_ret;
+ 
+     void clear_buffer() {
+-        m_dag.clear();
+-        m_light.clear();
+-        m_header.clear();
+-        m_searchBuffer.clear();
+-        m_queue.clear();
++        for(int i = 0; i < m_ethash_dag_nodes.size(); i++) {
++            m_ethash_dag_nodes[i].clear();
++        }
++        m_ethash_dag_nodes.clear();
++        m_ethash_ret.clear();
++    }
++
++    void clear_obj() {
++        for(int i = 0; i < m_searchKernel.size(); i++) {
++            m_searchKernel[i].clear();
++        }
++        m_searchKernel.clear();
++        m_program.clear();
++        m_binary.clear();
++    }
++
++    void clear_cq() {
+         m_context.clear();
+-        m_abortqueue.clear();
++        m_queue.clear();
+     }
+ 
+     CLSettings m_settings;
+ 
+     unsigned m_dagItems = 0;
+     uint64_t m_lastNonce = 0;
+-
+ };
+ 
+ }  // namespace eth
+diff --git a/libethash-cl/CMakeLists.txt b/libethash-cl/CMakeLists.txt
+index f190b97..b47b999 100644
+--- a/libethash-cl/CMakeLists.txt
++++ b/libethash-cl/CMakeLists.txt
+@@ -17,6 +17,7 @@ add_custom_target(clbin2h_stable DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/ethash.h ${
+ 
+ set(SOURCES
+ 	CLMiner.h CLMiner.cpp
++    xcl2.hpp xcl2.cpp
+ 	${CMAKE_CURRENT_BINARY_DIR}/ethash.h
+ )
+ 
+@@ -31,7 +32,21 @@ endif()
+ include_directories(${CMAKE_CURRENT_BINARY_DIR})
+ include_directories(..)
+ 
++#-----------------------start: add for FPGA-----------------------#
++if(NOT DEFINED ENV{XILINX_XRT})
++    message(FATAL_ERROR "not defined environment variable:XILINX_XRT")
++endif()
++include_directories("$ENV{XILINX_XRT}/include")
++include_directories("${CMAKE_CURRENT_SOURCE_DIR}/HLS_arbitrary_Precision_Types/include")
++link_directories(ethash-cl $ENV{XILINX_XRT}/lib/)
++message(STATUS "XILINX_XRT: $ENV{XILINX_XRT}")
++#-----------------------end: add for FPGA-----------------------#
++
+ add_library(ethash-cl ${SOURCES})
+ target_link_libraries(ethash-cl PUBLIC ethcore ethash::ethash)
+ target_link_libraries(ethash-cl PRIVATE OpenCL::OpenCL)
+ target_link_libraries(ethash-cl PRIVATE Boost::filesystem Boost::thread)
++#-----------------------start: add for FPGA-----------------------#
++#target_link_libraries(ethash-cl PRIVATE /lib64/libboost_filesystem-mt.so Boost::thread)
++#target_link_libraries(ethash-cl PRIVATE $ENV{XILINX_XRT}/lib/libxilinxopencl.so)
++#-----------------------end: add for FPGA-----------------------#
+diff --git a/libethash-cl/HLS_arbitrary_Precision_Types b/libethash-cl/HLS_arbitrary_Precision_Types
+new file mode 160000
+index 0000000..200a9ae
+--- /dev/null
++++ b/libethash-cl/HLS_arbitrary_Precision_Types
+@@ -0,0 +1 @@
++Subproject commit 200a9aecaadf471592558540dc5a88256cbf880f
+diff --git a/libethash-cl/xcl2.cpp b/libethash-cl/xcl2.cpp
+new file mode 100644
+index 0000000..9c9d4db
+--- /dev/null
++++ b/libethash-cl/xcl2.cpp
+@@ -0,0 +1,263 @@
++/**********
++Copyright (c) 2018, Xilinx, Inc.
++All rights reserved.
++Redistribution and use in source and binary forms, with or without modification,
++are permitted provided that the following conditions are met:
++1. Redistributions of source code must retain the above copyright notice,
++this list of conditions and the following disclaimer.
++2. Redistributions in binary form must reproduce the above copyright notice,
++this list of conditions and the following disclaimer in the documentation
++and/or other materials provided with the distribution.
++3. Neither the name of the copyright holder nor the names of its contributors
++may be used to endorse or promote products derived from this software
++without specific prior written permission.
++THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
++ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
++THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
++IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
++INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
++PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
++OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE,
++EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++**********/
++
++#include <unistd.h>
++#include <limits.h>
++#include <sys/stat.h>
++#include "xcl2.hpp"
++namespace xcl {
++std::vector<cl::Device> get_devices(const std::string& vendor_name) {
++    size_t i;
++    std::vector<cl::Platform> platforms;
++    cl::Platform::get(&platforms);
++    cl::Platform platform;
++    std::cout << "platform size: " << platforms.size() << std::endl;
++    for (i = 0; i < platforms.size(); i++) {
++        platform = platforms[i];
++        std::string platformName = platform.getInfo<CL_PLATFORM_NAME>();
++        if (platformName == vendor_name) {
++            std::cout << "Found Platform" << std::endl;
++            std::cout << "Platform Name: " << platformName.c_str() << std::endl;
++            break;
++        }
++    }
++    if (i == platforms.size()) {
++        std::cout << "Error: Failed to find Xilinx platform" << std::endl;
++        exit(EXIT_FAILURE);
++    }
++
++    // Getting ACCELERATOR Devices and selecting 1st such device
++    std::vector<cl::Device> devices;
++    platform.getDevices(CL_DEVICE_TYPE_ACCELERATOR, &devices);
++    return devices;
++}
++
++std::vector<cl::Device> get_xil_devices() {
++    return get_devices("Xilinx");
++}
++cl::Program::Binaries import_binary_file(std::string xclbin_file_name) {
++    std::cout << "INFO: Importing " << xclbin_file_name << std::endl;
++
++    if (access(xclbin_file_name.c_str(), R_OK) != 0) {
++        printf("ERROR: %s xclbin not available please build\n", xclbin_file_name.c_str());
++        exit(EXIT_FAILURE);
++    }
++    // Loading XCL Bin into char buffer
++    std::cout << "Loading: '" << xclbin_file_name.c_str() << "'\n";
++    std::ifstream bin_file(xclbin_file_name.c_str(), std::ifstream::binary);
++    bin_file.seekg(0, bin_file.end);
++    unsigned nb = bin_file.tellg();
++    bin_file.seekg(0, bin_file.beg);
++    char* buf = new char[nb];
++    bin_file.read(buf, nb);
++    bin_file.close();
++
++    cl::Program::Binaries bins;
++    bins.push_back({buf, nb});
++    return bins;
++}
++
++std::string find_binary_file(const std::string& _device_name, const std::string& xclbin_name) {
++    std::cout << "XCLBIN File Name: " << xclbin_name.c_str() << std::endl;
++    char* xcl_mode = getenv("XCL_EMULATION_MODE");
++    char* xcl_target = getenv("XCL_TARGET");
++    std::string mode;
++
++    /* Fall back mode if XCL_EMULATION_MODE is not set is "hw" */
++    if (xcl_mode == NULL) {
++        mode = "hw";
++    } else {
++        /* if xcl_mode is set then check if it's equal to true*/
++        if (strcmp(xcl_mode, "true") == 0) {
++            /* if it's true, then check if xcl_target is set */
++            if (xcl_target == NULL) {
++                /* default if emulation but not specified is software emulation */
++                mode = "sw_emu";
++            } else {
++                /* otherwise, it's what ever is specified in XCL_TARGET */
++                mode = xcl_target;
++            }
++        } else {
++            /* if it's not equal to true then it should be whatever
++             * XCL_EMULATION_MODE is set to */
++            mode = xcl_mode;
++        }
++    }
++    char* xcl_bindir = getenv("XCL_BINDIR");
++
++    // typical locations of directory containing xclbin files
++    const char* dirs[] = {xcl_bindir, // $XCL_BINDIR-specified
++                          "xclbin",   // command line build
++                          "..",       // gui build + run
++                          ".",        // gui build, run in build directory
++                          NULL};
++    const char** search_dirs = dirs;
++    if (xcl_bindir == NULL) {
++        search_dirs++;
++    }
++
++    char* device_name = strdup(_device_name.c_str());
++    if (device_name == NULL) {
++        printf("Error: Out of Memory\n");
++        exit(EXIT_FAILURE);
++    }
++
++    // fix up device name to avoid colons and dots.
++    // xilinx:xil-accel-rd-ku115:4ddr-xpr:3.2 -> xilinx_xil-accel-rd-ku115_4ddr-xpr_3_2
++    for (char* c = device_name; *c != 0; c++) {
++        if (*c == ':' || *c == '.') {
++            *c = '_';
++        }
++    }
++
++    char* device_name_versionless = strdup(_device_name.c_str());
++    if (device_name_versionless == NULL) {
++        printf("Error: Out of Memory\n");
++        exit(EXIT_FAILURE);
++    }
++
++    unsigned short colons = 0;
++    bool colon_exist = false;
++    for (char* c = device_name_versionless; *c != 0; c++) {
++        if (*c == ':') {
++            colons++;
++            *c = '_';
++            colon_exist = true;
++        }
++        /* Zero out version area */
++        if (colons == 3) {
++            *c = '\0';
++        }
++    }
++
++    // versionless support if colon doesn't exist in device_name
++    if (!colon_exist) {
++        int len = strlen(device_name_versionless);
++        device_name_versionless[len - 4] = '\0';
++    }
++
++    const char* aws_file_patterns[] = {
++        "%1$s/%2$s.%3$s.%4$s.awsxclbin",     // <kernel>.<target>.<device>.awsxclbin
++        "%1$s/%2$s.%3$s.%5$s.awsxclbin",     // <kernel>.<target>.<device_versionless>.awsxclbin
++        "%1$s/binary_container_1.awsxclbin", // default for gui projects
++        "%1$s/%2$s.awsxclbin",               // <kernel>.awsxclbin
++        NULL};
++
++    const char* file_patterns[] = {"%1$s/%2$s.%3$s.%4$s.xclbin",     // <kernel>.<target>.<device>.xclbin
++                                   "%1$s/%2$s.%3$s.%5$s.xclbin",     // <kernel>.<target>.<device_versionless>.xclbin
++                                   "%1$s/binary_container_1.xclbin", // default for gui projects
++                                   "%1$s/%2$s.xclbin",               // <kernel>.xclbin
++                                   NULL};
++    char xclbin_file_name[PATH_MAX];
++    memset(xclbin_file_name, 0, PATH_MAX);
++    ino_t aws_ino = 0; // used to avoid errors if an xclbin found via multiple/repeated paths
++    for (const char** dir = search_dirs; *dir != NULL; dir++) {
++        struct stat sb;
++        if (stat(*dir, &sb) == 0 && S_ISDIR(sb.st_mode)) {
++            for (const char** pattern = aws_file_patterns; *pattern != NULL; pattern++) {
++                char file_name[PATH_MAX];
++                memset(file_name, 0, PATH_MAX);
++                snprintf(file_name, PATH_MAX, *pattern, *dir, xclbin_name.c_str(), mode.c_str(), device_name,
++                         device_name_versionless);
++                if (stat(file_name, &sb) == 0 && S_ISREG(sb.st_mode)) {
++                    char* bindir = strdup(*dir);
++                    if (bindir == NULL) {
++                        printf("Error: Out of Memory\n");
++                        exit(EXIT_FAILURE);
++                    }
++                    if (*xclbin_file_name && sb.st_ino != aws_ino) {
++                        printf("Error: multiple xclbin files discovered:\n %s\n %s\n", file_name, xclbin_file_name);
++                        exit(EXIT_FAILURE);
++                    }
++                    aws_ino = sb.st_ino;
++                    strncpy(xclbin_file_name, file_name, PATH_MAX);
++                }
++            }
++        }
++    }
++    ino_t ino = 0; // used to avoid errors if an xclbin found via multiple/repeated paths
++    // if no awsxclbin found, check for xclbin
++    if (*xclbin_file_name == '\0') {
++        for (const char** dir = search_dirs; *dir != NULL; dir++) {
++            struct stat sb;
++            if (stat(*dir, &sb) == 0 && S_ISDIR(sb.st_mode)) {
++                for (const char** pattern = file_patterns; *pattern != NULL; pattern++) {
++                    char file_name[PATH_MAX];
++                    memset(file_name, 0, PATH_MAX);
++                    snprintf(file_name, PATH_MAX, *pattern, *dir, xclbin_name.c_str(), mode.c_str(), device_name,
++                             device_name_versionless);
++                    if (stat(file_name, &sb) == 0 && S_ISREG(sb.st_mode)) {
++                        char* bindir = strdup(*dir);
++                        if (bindir == NULL) {
++                            printf("Error: Out of Memory\n");
++                            exit(EXIT_FAILURE);
++                        }
++                        if (*xclbin_file_name && sb.st_ino != ino) {
++                            printf("Error: multiple xclbin files discovered:\n %s\n %s\n", file_name, xclbin_file_name);
++                            exit(EXIT_FAILURE);
++                        }
++                        ino = sb.st_ino;
++                        strncpy(xclbin_file_name, file_name, PATH_MAX);
++                    }
++                }
++            }
++        }
++    }
++    // if no xclbin found, preferred path for error message from xcl_import_binary_file()
++    if (*xclbin_file_name == '\0') {
++        snprintf(xclbin_file_name, PATH_MAX, file_patterns[0], *search_dirs, xclbin_name.c_str(), mode.c_str(),
++                 device_name);
++    }
++    free(device_name);
++    return (xclbin_file_name);
++}
++
++bool is_emulation() {
++    bool ret = false;
++    char* xcl_mode = getenv("XCL_EMULATION_MODE");
++    if (xcl_mode != NULL) {
++        ret = true;
++    }
++    return ret;
++}
++
++bool is_hw_emulation() {
++    bool ret = false;
++    char* xcl_mode = getenv("XCL_EMULATION_MODE");
++    if ((xcl_mode != NULL) && !strcmp(xcl_mode, "hw_emu")) {
++        ret = true;
++    }
++    return ret;
++}
++
++bool is_xpr_device(const char* device_name) {
++    const char* output = strstr(device_name, "xpr");
++
++    if (output == NULL) {
++        return false;
++    } else {
++        return true;
++    }
++}
++};
+diff --git a/libethash-cl/xcl2.hpp b/libethash-cl/xcl2.hpp
+new file mode 100644
+index 0000000..6ab9361
+--- /dev/null
++++ b/libethash-cl/xcl2.hpp
+@@ -0,0 +1,96 @@
++/**********
++Copyright (c) 2018, Xilinx, Inc.
++All rights reserved.
++Redistribution and use in source and binary forms, with or without modification,
++are permitted provided that the following conditions are met:
++1. Redistributions of source code must retain the above copyright notice,
++this list of conditions and the following disclaimer.
++2. Redistributions in binary form must reproduce the above copyright notice,
++this list of conditions and the following disclaimer in the documentation
++and/or other materials provided with the distribution.
++3. Neither the name of the copyright holder nor the names of its contributors
++may be used to endorse or promote products derived from this software
++without specific prior written permission.
++THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
++ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
++THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
++IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
++INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
++PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
++OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE,
++EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++**********/
++
++#pragma once
++
++#define CL_HPP_CL_1_2_DEFAULT_BUILD
++#define CL_HPP_TARGET_OPENCL_VERSION 120
++#define CL_HPP_MINIMUM_OPENCL_VERSION 120
++#define CL_HPP_ENABLE_PROGRAM_CONSTRUCTION_FROM_ARRAY_COMPATIBILITY 1
++
++#include <CL/cl2.hpp>
++#include <iostream>
++#include <fstream>
++
++// When creating a buffer with user pointer (CL_MEM_USE_HOST_PTR), under the hood
++// User ptr is used if and only if it is properly aligned (page aligned). When not
++// aligned, runtime has no choice but to create its own host side buffer that backs
++// user ptr. This in turn implies that all operations that move data to and from
++// device incur an extra memcpy to move data to/from runtime's own host buffer
++// from/to user pointer. So it is recommended to use this allocator if user wish to
++// Create Buffer/Memory Object with CL_MEM_USE_HOST_PTR to align user buffer to the
++// page boundary. It will ensure that user buffer will be used when user create
++// Buffer/Mem Object with CL_MEM_USE_HOST_PTR.
++template <typename T>
++struct aligned_allocator {
++    using value_type = T;
++    T* allocate(std::size_t num) {
++        void* ptr = nullptr;
++        if (posix_memalign(&ptr, 4096, num * sizeof(T))) throw std::bad_alloc();
++        return reinterpret_cast<T*>(ptr);
++    }
++    void deallocate(T* p, std::size_t num) { free(p); }
++};
++
++namespace xcl {
++std::vector<cl::Device> get_xil_devices();
++std::vector<cl::Device> get_devices(const std::string& vendor_name);
++/* find_xclbin_file
++ *
++ *
++ * Description:
++ *   Find precompiled program (as commonly created by the Xilinx OpenCL
++ *   flow). Using search path below.
++ *
++ *   Search Path:
++ *      $XCL_BINDIR/<name>.<target>.<device>.xclbin
++ *      $XCL_BINDIR/<name>.<target>.<device_versionless>.xclbin
++ *      $XCL_BINDIR/binary_container_1.xclbin
++ *      $XCL_BINDIR/<name>.xclbin
++ *      xclbin/<name>.<target>.<device>.xclbin
++ *      xclbin/<name>.<target>.<device_versionless>.xclbin
++ *      xclbin/binary_container_1.xclbin
++ *      xclbin/<name>.xclbin
++ *      ../<name>.<target>.<device>.xclbin
++ *      ../<name>.<target>.<device_versionless>.xclbin
++ *      ../binary_container_1.xclbin
++ *      ../<name>.xclbin
++ *      ./<name>.<target>.<device>.xclbin
++ *      ./<name>.<target>.<device_versionless>.xclbin
++ *      ./binary_container_1.xclbin
++ *      ./<name>.xclbin
++ *
++ * Inputs:
++ *   _device_name - Targeted Device name
++ *   xclbin_name - base name of the xclbin to import.
++ *
++ * Returns:
++ *   An opencl program Binaries object that was created from xclbin_name file.
++ */
++std::string find_binary_file(const std::string& _device_name, const std::string& xclbin_name);
++cl::Program::Binaries import_binary_file(std::string xclbin_file_name);
++bool is_emulation();
++bool is_hw_emulation();
++bool is_xpr_device(const char* device_name);
++}
+diff --git a/libethcore/Farm.cpp b/libethcore/Farm.cpp
+index 92478cf..1bf9020 100644
+--- a/libethcore/Farm.cpp
++++ b/libethcore/Farm.cpp
+@@ -259,17 +259,10 @@ bool Farm::start()
+     // Start all subscribed miners if none yet
+     if (!m_miners.size())
+     {
++/*
+         for (auto it = m_DevicesCollection.begin(); it != m_DevicesCollection.end(); it++)
+         {
+             TelemetryAccountType minerTelemetry;
+-#if ETH_ETHASHCUDA
+-            if (it->second.subscriptionType == DeviceSubscriptionTypeEnum::Cuda)
+-            {
+-                minerTelemetry.prefix = "cu";
+-                m_miners.push_back(std::shared_ptr<Miner>(
+-                    new CUDAMiner(m_miners.size(), m_CUSettings, it->second)));
+-            }
+-#endif
+ #if ETH_ETHASHCL
+ 
+             if (it->second.subscriptionType == DeviceSubscriptionTypeEnum::OpenCL)
+@@ -279,20 +272,17 @@ bool Farm::start()
+                     new CLMiner(m_miners.size(), m_CLSettings, it->second)));
+             }
+ #endif
+-#if ETH_ETHASHCPU
+-
+-            if (it->second.subscriptionType == DeviceSubscriptionTypeEnum::Cpu)
+-            {
+-                minerTelemetry.prefix = "cp";
+-                m_miners.push_back(std::shared_ptr<Miner>(
+-                    new CPUMiner(m_miners.size(), m_CPSettings, it->second)));
+-            }
+-#endif
+             if (minerTelemetry.prefix.empty())
+                 continue;
+             m_telemetry.miners.push_back(minerTelemetry);
+             m_miners.back()->startWorking();
+         }
++*/
++        TelemetryAccountType minerTelemetry;
++        minerTelemetry.prefix = "cl";
++        m_miners.push_back(std::shared_ptr<Miner>(new CLMiner(m_miners.size(), m_CLSettings, m_DevicesCollection)));
++        m_telemetry.miners.push_back(minerTelemetry);
++        m_miners.back()->startWorking();
+ 
+         // Initialize DAG Load mode
+         Miner::setDagLoadInfo(m_Settings.dagLoadMode, (unsigned int)m_miners.size());
+diff --git a/libethcore/Miner.h b/libethcore/Miner.h
+index 082f203..32935ea 100644
+--- a/libethcore/Miner.h
++++ b/libethcore/Miner.h
+@@ -78,7 +78,8 @@ enum class ClPlatformTypeEnum
+     Amd,
+     Clover,
+     Nvidia,
+-    Intel
++    Intel,
++    Xilinx
+ };
+ 
+ enum class SolutionAccountingEnum
+-- 
+1.9.5
+
