@@ -18,7 +18,6 @@
 #     See the License for the specific language governing permissions and
 #     limitations under the License.
 
-# This is script to download ethminer from github, make Xilinx patch to it and build.
 
 function print_help() {
     echo ""
@@ -87,7 +86,7 @@ function build_host() {
     else
         echo "Download ethminer"
         git clone https://github.com/ethereum-mining/ethminer.git
-        https://boostorg.jfrog.io/artifactory/main/release/1.66.0/source/boost_1_66_0.7z
+        wget https://boostorg.jfrog.io/artifactory/main/release/1.66.0/source/boost_1_66_0.7z
         mv boost_1_66_0.7z ~/.hunter/_Base/Download/Boost/1.66.0/075d0b4/
         cd ethminer
         git checkout -b xilinx_platform
