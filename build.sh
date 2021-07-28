@@ -91,6 +91,8 @@ function build_host() {
         cd ethminer
         git checkout -b xilinx_platform
         git reset --hard cd75c13d38eceb6fed78d47104440a762ca1894e
+        git config user.email "dummy@dummy.com"
+        git config user.name "Dummy Name"
         git am --abort
         git am ../sw/*.patch
         git submodule update --init --recursive
