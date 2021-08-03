@@ -74,7 +74,10 @@ function build_daggen() {
 
 function get_xclbin() {
     echo ""
-    echo "Download xclbins files needed from Xilinx OMS, not finished yet"
+    echo "Download xclbins files needed from Xilinx OMS"
+    echo "dag_gen_kernel.xclbin:  https://www.xilinx.com/member/forms/download/xef.html?filename=dag_gen_kernel.xclbin"
+    echo "ethash_kernel.xclbin:   https://www.xilinx.com/member/forms/download/xef.html?filename=ethash_kernel.xclbin"
+    echo "Pleaase put the xclbin files listed above to the same directory of this build.sh script"
     echo ""
 }
 
