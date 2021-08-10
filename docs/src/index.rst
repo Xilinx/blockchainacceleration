@@ -62,7 +62,7 @@ Vitis Ethereum Mining Library is an open-source Vitis Library written in C++ to 
    :caption: Version
    :hidden:
 
-   1.0 <https://xilinx.github.io/blockchainacceleration/>
+   1.0 <https://xilinx.github.io/cryptocurrency/>
 
 
 
