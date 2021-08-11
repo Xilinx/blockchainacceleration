@@ -8,8 +8,8 @@ Currently, this solution offers:
 * On host side, a patch to "ethminer" which is the most popular mining software, for customer to do mining with their own account and desired mining pool.
 
 ## Requirement
-* Currently this solution support Xilinx Alveo U55N, you need installed packages for the card, like XRT / firmware and development package for the card.
-* If you would like to build the xclbin files on your own machine, you'll also need Vitis that is at least 2021.1_released or later version. You could also download pre-buildt xclbin files from Xilinx. Please take reference from "Step to run". 
+* Currently this solution support Xilinx Varium C1100, you need installed packages for the card, like XRT / firmware and development package for the card.
+* If you would like to build the xclbin files on your own machine, you'll also need Vitis that is at least 2021.1 or later version. You could also download pre-buildt xclbin files from Xilinx. Please take reference from "Step to run". 
 
 ## Step to run
 * 1. Get xclbins ready.
