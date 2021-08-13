@@ -26,6 +26,7 @@ Software Platform
 This library is designed to work with Vitis 2021.1 and later, and therefore inherits the system requirements of Vitis and XRT.
 
 Supported operating systems are RHEL/CentOS 7.4 or higher, 18.04.1 LTS.
+This library needs OpenCL headers to be ready before building.
 With CentOS/RHEL, C++11/C++14 should be enabled via
 [devtoolset-6](https://www.softwarecollections.org/en/scls/rhscl/devtoolset-6/).
 

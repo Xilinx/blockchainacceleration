@@ -83,6 +83,10 @@ function get_xclbin() {
 
 function build_host() {
     echo ""
+    echo "Please install OpenCL headrs before building host"
+    echo "On Ubuntu, you may try 'sudo yum install opencl-headers' "
+    echo "On CentOS, you may try 'sudo apt-get install -y opencl-headers' "
+
     if [ ! $XILINX_XRT ]
     then
         echo "Please setup XRT"
