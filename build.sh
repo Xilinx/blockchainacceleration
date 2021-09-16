@@ -81,6 +81,41 @@ function get_xclbin() {
     echo ""
 }
 
+function check_devtool() {
+    echo ""
+    echo "INFO : checking devtool version ..."
+    DEVTOOLPATH=/etc/scl/conf
+    cd $DEVTOOLPATH
+
+    for file in ./*
+    do
+        if [ $file == "./devtoolset-7" ] || [ $file == "./devtoolset-8" ]
+        then
+            #echo $file
+            break
+        fi
+    done
+
+    if [ -e $file ]
+        then
+            DEVTOOL=${file:2:13}
+            echo "INFO : check devtool $DEVTOOL passed!"
+            echo "INFO : If there is still regex_error when run the board, Please rerun the following steps:"
+            echo "INFO : 1. rm -rf ~/.hunter "
+            echo "INFO : 2. mkdir -p ~/.hunter/_Base/Download/Boost/1.66.0/075d0b4/"
+            echo "INFO : 3. scl enable $DEVTOOL bash"
+            echo "INFO : 4. . build.sh build_host"
+    else
+        echo"WARNING : regex_error occures when the version of GCC using the Developer Toolset software collection is less than 6!"
+    fi
+    cd $OLDPWD
+    echo ""
+    #echo $DEVTOOL
+    #scl enable $file bash
+    #echo "get_devtool done"
+    #return $DEVTOOL
+}
+
 function build_host() {
     echo ""
     echo "Please install OpenCL headrs before building host"
@@ -91,6 +126,7 @@ function build_host() {
     then
         echo "Please setup XRT"
     else
+        check_devtool
         echo "Download ethminer"
         git clone https://github.com/ethereum-mining/ethminer.git
         wget https://boostorg.jfrog.io/artifactory/main/release/1.66.0/source/boost_1_66_0.7z
