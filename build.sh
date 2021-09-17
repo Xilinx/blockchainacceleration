@@ -45,7 +45,7 @@ function build_ethash() {
         export TARGET=hw
         echo "Start to build ethash_kernel.xclbin, will takes several hours"
         cd ./hw/ethash8Greturn
-        make all
+        make xclbin
         cp build_dir.$TARGET.$DEVICE/ethash_kernel.xclbin ../../
         cd ../..
     fi
@@ -65,7 +65,7 @@ function build_daggen() {
         export TARGET=hw
         echo "Start to build dag_gen_kernel.xclbin, will takes several hours"
         cd ./hw/genDAG
-        make all
+        make xclbin
         cp build_dir.$TARGET.$DEVICE/dag_gen_kernel.xclbin ../../
         cd ../..
     fi
@@ -119,14 +119,16 @@ function check_devtool() {
 function build_host() {
     echo ""
     echo "Please install OpenCL headrs before building host"
-    echo "On Ubuntu, you may try 'sudo yum install opencl-headers' "
-    echo "On CentOS, you may try 'sudo apt-get install -y opencl-headers' "
+    echo "On CentOS, you may try 'sudo yum install opencl-headers' "
+    echo "On Ubuntu, you may try 'sudo apt-get install -y opencl-headers' "
 
     if [ ! $XILINX_XRT ]
     then
         echo "Please setup XRT"
     else
         check_devtool
+        rm -rf boost_1_66_0.7z
+        rm -rf ethminer
         echo "Download ethminer"
         git clone https://github.com/ethereum-mining/ethminer.git
         wget https://boostorg.jfrog.io/artifactory/main/release/1.66.0/source/boost_1_66_0.7z

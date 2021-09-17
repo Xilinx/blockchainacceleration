@@ -143,7 +143,7 @@ ethash_kernel6_VPP_FLAGS +=  -D KERNEL_NAME=ethash_kernel6
 ethash_kernel7_VPP_FLAGS +=  -D KERNEL_NAME=ethash_kernel7
 
 # Kernel linker flags
-LDCLFLAGS_ethash_kernel += --nk ethash_kernel0:1:ethash_kernel0 --nk ethash_kernel1:1:ethash_kernel1 --nk ethash_kernel2:1:ethash_kernel2 --nk ethash_kernel3:1:ethash_kernel3  --nk ethash_kernel4:1:ethash_kernel4 --nk ethash_kernel5:1:ethash_kernel5 --nk ethash_kernel6:1:ethash_kernel6 --nk ethash_kernel7:1:ethash_kernel7
+#LDCLFLAGS_ethash_kernel += --nk ethash_kernel0:1:ethash_kernel0 --nk ethash_kernel1:1:ethash_kernel1 --nk ethash_kernel2:1:ethash_kernel2 --nk ethash_kernel3:1:ethash_kernel3  --nk ethash_kernel4:1:ethash_kernel4 --nk ethash_kernel5:1:ethash_kernel5 --nk ethash_kernel6:1:ethash_kernel6 --nk ethash_kernel7:1:ethash_kernel7
 ############################## Declaring Binary Containers ##############################
 BINARY_CONTAINERS += $(BUILD_DIR)/ethash_kernel.xclbin
 BINARY_CONTAINER_ethash_kernel_OBJS += $(TEMP_DIR)/ethash_kernel0.xo
